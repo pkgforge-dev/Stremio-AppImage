@@ -4,116 +4,97 @@ set -eu
 
 ARCH=$(uname -m)
 
-# upstream only publishes a 64bit x86 deb
+# aarch64 cannot be built: the shell requires Qt5WebEngine, and there is no
+# aarch64 build of qt5-webengine in the Arch repos, the AUR or ALARM
 if [ "$ARCH" != 'x86_64' ]; then
 	echo "Stremio has no $ARCH build, bailing out..."
 	exit 1
 fi
 
+SHELL_REPO=https://github.com/Stremio/stremio-shell.git
+BUILD_DIR=$PWD/build
+
 echo "Installing package dependencies..."
 echo "---------------------------------------------------------------"
-# pipewire-jack provides the libjack.so that libmpv and ffmpeg link against, it
-# has to be installed first so pacman picks it instead of the jack server
+# libmpv links against libjack.so.0, so something has to provide it, and
+# pipewire-jack is the one that works without a jack server running
 pacman -Syu --noconfirm \
+	cmake             \
 	curl              \
-	git               \
 	mpv               \
 	nodejs            \
-	patchelf          \
 	pipewire-jack     \
+	qt5-base          \
+	qt5-declarative   \
 	qt5-quickcontrols \
 	qt5-quickcontrols2
 
 echo "Installing debloated packages..."
 echo "---------------------------------------------------------------"
-# ffmpeg-mini is also the ffmpeg stremio spawns for HLS and casting
 get-debloated-pkgs --add-common --prefer-nano ffmpeg-mini
 
-echo "Installing Qt5 WebEngine and OpenSSL 1.1..."
+echo "Installing Qt5 WebEngine..."
 echo "---------------------------------------------------------------"
 # qt5-webengine and the qt5-webchannel and qt5-location it needs were dropped
-# from the Arch repos, and the shell still links against the OpenSSL 1.1 ABI
-# (OpenSSL 3 does not carry the OPENSSL_1_1_0 symbol versions it asks for)
-make-aur-package --archlinuxcn openssl-1.1 qt5-webengine
+# from the Arch repos
+make-aur-package --archlinuxcn qt5-webengine
 
-echo "Getting Stremio..."
+echo "Getting the shell sources..."
 echo "---------------------------------------------------------------"
-# the deb linked from the official downloads page is the build upstream ships
-# to Linux users, there is no API or feed that lists the shell releases
-DEB_LINK=$(curl -sSfL --retry 5 https://www.stremio.com/downloads |
-	grep -oE 'https://dl\.strem\.io/shell-linux/v[0-9.]+/stremio_[0-9.]+-1_amd64\.deb' |
-	head -n 1) || :
-
-if [ -z "${DEB_LINK-}" ]; then
-	# if the page ever changes, walk the release tags and use the newest one
-	# that actually has a published deb
-	echo "No deb found in the downloads page, checking the release tags..."
-	for v in $(git ls-remote --tags --refs https://github.com/Stremio/stremio-shell.git |
-		awk -F/ '{print $NF}' | sed 's/^v\.\?//' | sort -rV); do
-		link="https://dl.strem.io/shell-linux/v$v/stremio_$v-1_amd64.deb"
-		if curl -sSfI -o /dev/null "$link"; then
-			DEB_LINK=$link
-			break
-		fi
-	done
-fi
-
-if [ -z "${DEB_LINK-}" ]; then
-	echo "ERROR: could not find a published Stremio deb!"
-	exit 1
-fi
-
-echo "Downloading $DEB_LINK"
-curl -sSfL --retry 30 --retry-connrefused "$DEB_LINK" -o /tmp/stremio.deb
-
-CONTROL=$(bsdtar -tf /tmp/stremio.deb | grep -E '^control\.tar')
-DATA=$(bsdtar -tf /tmp/stremio.deb | grep -E '^data\.tar')
-
-# the version declared inside the deb is the authoritative one
-bsdtar -xOf /tmp/stremio.deb "$CONTROL" |
-	bsdtar -xOf - ./control |
-	awk -F': ' '/^Version:/{print $2; exit}' |
-	cut -d- -f1 > ~/version
-
+rm -rf "$BUILD_DIR"
+git clone "$SHELL_REPO" "$BUILD_DIR/shell" && (
+	cd "$BUILD_DIR/shell"
+	# the tag list also carries -qt6 and other work in progress names, so only
+	# plain dotted numbers are considered
+	tag=$(git tag --sort=-v:refname | grep -E '^v?[0-9]+(\.[0-9]+)+$' | head -n 1)
+	git checkout -q "$tag"
+	git submodule update --init --depth 1 deps/libmpv deps/singleapplication
+	echo "${tag#v}" > ~/version
+)
 echo "Stremio version: $(cat ~/version)"
+
+echo "Getting the streaming server..."
+echo "---------------------------------------------------------------"
+# the shell does not ship server.js, its URL is pinned per tag in
+# server-url.txt so the server always matches the shell
+SERVER_URL=$(cat "$BUILD_DIR/shell/server-url.txt")
+curl -sSfL --retry 30 --retry-connrefused "$SERVER_URL" \
+	-o "$BUILD_DIR/shell/server.js"
+
+echo "Building the shell..."
+echo "---------------------------------------------------------------"
+mkdir -p "$BUILD_DIR/build" && (
+	cd "$BUILD_DIR/build"
+	cmake -G "Unix Makefiles" \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX="$BUILD_DIR/staging" \
+		"$BUILD_DIR/shell"
+	make -j"$(nproc)"
+	make install
+)
+
+# cmake only installs the binary itself, the streaming server and the desktop
+# entry are installed by the shell's release.makefile which we cannot use
+# because it also downloads server.js
+STAGING=$BUILD_DIR/staging/opt/stremio
+cp -v "$BUILD_DIR/shell/server.js" "$STAGING/server.js"
+cp -v "$BUILD_DIR/shell/smartcode-stremio.desktop" "$STAGING/smartcode-stremio.desktop"
 
 echo "Preparing AppDir..."
 echo "---------------------------------------------------------------"
 mkdir -p ./AppDir/bin
-# ./opt/stremio/* -> ./AppDir/bin
-bsdtar -xOf /tmp/stremio.deb "$DATA" |
-	bsdtar -xf - --strip-components=3 -C ./AppDir/bin/
+cp -rv "$STAGING"/. ./AppDir/bin/
 
-# this is a symlink to /usr/bin/node, which does not exist inside an AppImage,
-# the real node binary is deployed by quick-sharun instead
-rm -f ./AppDir/bin/node
+# the desktop entry and a single icon go at the top level of the AppDir, which
+# is where quick-sharun looks for them, the tray icon falls back to the one
+# embedded in the shell so no icon theme is needed
+cp -v ./AppDir/bin/smartcode-stremio.desktop ./AppDir
+cp -v "$BUILD_DIR/shell/images/stremio.svg" ./AppDir/smartcode-stremio.svg
 
-# the shell links against the libmpv 1 ABI, the client API it uses did not
-# change in libmpv 2, so pointing it at the soname Arch ships is enough
-if patchelf --print-needed ./AppDir/bin/stremio | grep -qx 'libmpv\.so\.1'; then
-	patchelf --replace-needed libmpv.so.1 libmpv.so.2 ./AppDir/bin/stremio
-fi
-
-# stremio's own updater downloads and runs the upstream AppImage when it sees
-# that it runs from /tmp/.mount_*, which is exactly where uruntime mounts this
-# AppImage. Updates are handled by quick-sharun's self-updater instead.
-# NOTE: the replacement has to be the same length, otherwise the rest of the
-# file shifts and the ELF is corrupted
+# stremio's own updater replaces itself with the upstream AppImage when it
+# sees that it runs from /tmp/.mount_*, which is where uruntime mounts this
+# AppImage, so that check is neutralized and quick-sharun's self-updater is
+# used instead. The replacement has to be the same length or the ELF breaks
 if grep -aq -m 1 '/tmp/\.mount_' ./AppDir/bin/stremio; then
 	sed -i -e 's|/tmp/\.mount_|/nonexistent|' ./AppDir/bin/stremio
 fi
-
-# the desktop entry and the window and tray icons are looked up by name from
-# the icon theme, they are named <app>_<size>.png inside the deb
-cp -v ./AppDir/bin/smartcode-stremio.desktop ./AppDir
-rm -f ./AppDir/bin/smartcode-stremio.desktop
-
-for f in ./AppDir/bin/icons/*.png; do
-	name=${f##*/}
-	name=${name%.png}
-	size=${name##*_}
-	name=${name%_*}
-	mkdir -p ./AppDir/share/icons/hicolor/"${size}x${size}"/apps
-	cp -v "$f" ./AppDir/share/icons/hicolor/"${size}x${size}"/apps/"$name".png
-done
-rm -rf ./AppDir/bin/icons
